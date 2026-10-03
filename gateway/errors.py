@@ -103,7 +103,7 @@ def map_transport_error(exc: Exception) -> GatewayError:
     if isinstance(exc, GatewayError):
         return exc
     if isinstance(exc, httpx.TimeoutException):
-        return UpstreamTimeoutError(f"上游调用超时: {exc.__class__.__name__}")
+        return UpstreamTimeoutError("上游调用超时", detail=exc.__class__.__name__)
     if isinstance(exc, httpx.TransportError):
-        return UpstreamConnectionError(f"上游连接失败: {exc.__class__.__name__}")
-    return GatewayError(f"上游调用出现未分类异常: {exc.__class__.__name__}")
+        return UpstreamConnectionError("上游连接失败", detail=exc.__class__.__name__)
+    return GatewayError("上游调用出现未分类异常", detail=exc.__class__.__name__)
