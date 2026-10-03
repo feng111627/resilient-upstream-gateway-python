@@ -1,13 +1,8 @@
-import uvicorn
-from fastapi import FastAPI
+"""Launcher: run the gateway with uvicorn.
 
-app = FastAPI()
+    UPSTREAM_BASE_URL=http://upstream:8080 uvicorn main:app
+"""
 
+from app.main import app
 
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
-
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=0)
+__all__ = ["app"]
