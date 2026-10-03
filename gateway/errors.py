@@ -91,5 +91,19 @@ class SchemaMismatchError(GatewayError):
 
 
 def map_transport_error(exc: Exception) -> GatewayError:
-    """把 httpx 等底层异常归一成 GatewayError。占位实现。"""
-    raise NotImplementedError
+    """把 httpx 等底层异常归一成 GatewayError，绝不原样透出底层异常。
+
+    映射规则：
+    - httpx.TimeoutException（含 ConnectTimeout/ReadTimeout 等）-> 超时
+    - httpx.TransportError（连接拒绝、DNS、网络不可达等）-> 连接失败
+    - 其他未知异常 -> UNKNOWN 兜底
+    """
+    import httpx
+
+    if isinstance(exc, GatewayError):
+        return exc
+    if isinstance(exc, httpx.TimeoutException):
+        return UpstreamTimeoutError(f"上游调用超时: {exc.__class__.__name__}")
+    if isinstance(exc, httpx.TransportError):
+        return UpstreamConnectionError(f"上游连接失败: {exc.__class__.__name__}")
+    return GatewayError(f"上游调用出现未分类异常: {exc.__class__.__name__}")
