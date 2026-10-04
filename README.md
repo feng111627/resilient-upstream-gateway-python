@@ -1,8 +1,9 @@
 # resilient-upstream-gateway
 
 对接不稳定上游接口的弹性网关：把超时、连接失败、上游 4xx/5xx 等失败归一成
-可区分的错误结论，配合重试、熔断、限流、幂等键与多版本兼容，
-绝不把底层库（httpx 等）的异常原样透给调用方。
+可区分的错误结论，配合重试、熔断、限流、并发名额（舱壁）、幂等键与多版本兼容，
+绝不把底层库（httpx 等）的异常原样透给调用方。**支持同时登记多个带名字的上游，
+每个上游的配置与运行状态完全隔离。**
 
 ## 结构
 
@@ -11,13 +12,75 @@ gateway/
   errors.py           错误归一化：底层异常 -> 可区分的 GatewayError
   circuit_breaker.py  熔断器：关闭/打开/半开三态，线程安全
   rate_limiter.py     令牌桶限流
+  concurrency.py      并发名额限制（舱壁）：reject/wait 两种溢出策略
   retry.py            指数退避 + 抖动的重试策略
-  idempotency.py      幂等键：重复提交复用首个请求的结论
-  versioning.py       版本协商与响应 schema 校验
-  client.py           ResilientUpstreamClient：以上能力的组合
-main.py               FastAPI 入口：POST /gateway/{path}
+  idempotency.py      幂等键：重复提交复用结论；同键换内容报冲突
+  versioning.py       版本协商 + 请求按版本组装校验 + 响应 schema 校验
+  client.py           ResilientUpstreamClient：以上能力的组合（单上游）
+  registry.py         多上游注册表：按名字路由，配置与状态逐上游隔离
+main.py               FastAPI 入口：POST /gateway/{upstream}/{path}
 tests/                单测 + 本地模拟上游（不依赖任何外部服务）
 ```
+
+## 多上游配置
+
+环境变量 `UPSTREAMS` 为 JSON，键是上游名，值是该上游的完整配置
+（对应 `UpstreamConfig` 的字段，全部有默认值，可只写差异项）：
+
+```bash
+export UPSTREAMS='{
+  "pay":  {"base_url": "http://127.0.0.1:9001", "timeout": 3.0,
+           "max_in_flight": 10, "overflow": "reject",
+           "failure_threshold": 5, "rate": 50.0, "rate_capacity": 100.0},
+  "risk": {"base_url": "http://127.0.0.1:9002", "timeout": 8.0,
+           "max_in_flight": 3, "overflow": "wait", "max_wait": 0.5,
+           "max_attempts": 2, "recovery_timeout": 60.0}
+}'
+uv run python main.py
+```
+
+未设置 `UPSTREAMS` 时回退到单上游：`UPSTREAM_BASE_URL`（默认
+`http://127.0.0.1:9000`），名字为 `default`。
+
+每个上游可独立配置的项（`UpstreamConfig`）：
+
+| 配置项 | 默认 | 说明 |
+|---------------------|----------|--------------------------------|
+| `base_url` / `timeout` | — / 5.0 | 上游地址与单次调用超时 |
+| `max_attempts` 等 `retry_*` | 3 次 | 重试次数、退避基数/上限、抖动 |
+| `failure_threshold` 等 | 5 / 2 / 30s | 熔断阈值、半开成功阈值、恢复时长 |
+| `rate` / `rate_capacity` | 50 / 100 | 令牌桶限速与囤积上限 |
+| `max_in_flight` | 20 | 该上游允许同时在飞的请求数 |
+| `overflow` / `max_wait` | reject / 0 | 名额满：立刻报容量满，或最多等 `max_wait` 秒 |
+
+代码侧等价用法：
+
+```python
+from gateway.registry import UpstreamConfig, UpstreamRegistry
+
+registry = UpstreamRegistry()
+registry.register(UpstreamConfig(name="pay", base_url="http://pay:9001"))
+registry.register(UpstreamConfig(name="risk", base_url="http://risk:9002",
+                                 max_in_flight=3, overflow="wait", max_wait=0.5))
+registry.call("pay", "/pay", payload={"amount": 100, "currency": "CNY"})
+```
+
+## 隔离与配额规则
+
+- **逐上游独立组件**：每个上游独享 httpx 客户端（独立地址/超时）、重试策略、
+  熔断器、令牌桶、并发名额、幂等存储。某个上游挂了或一直超时，只会熔断、
+  限流、占满**它自己**的额度，别的上游照常服务。
+- **并发名额（舱壁）**：每个上游限制同时在飞请求数 `max_in_flight`。名额在
+  进入调用时获取，无论成功、失败还是中途被限流/熔断放弃，都在 finally 中
+  归还——慢上游不会泄漏名额，也不会占别的上游的名额。溢出策略：
+  - `overflow="reject"`：立刻返回 `capacity_full`（HTTP 503），
+    与超时（504）/熔断（503 但 `circuit_open`）是可区分的类别；
+  - `overflow="wait"`：最多等 `max_wait` 秒，等到名额就继续，等不到才报
+    `capacity_full`，不会无限堆积拖垮内存。
+- **健康检查按上游分别上报**，不给笼统的整体状态：
+  - `GET /health` → `{"status": "ok", "upstreams": {"pay": {...}, "risk": {...}}}`
+  - `GET /health/{upstream}` → 单个上游的
+    `{"circuit": ..., "in_flight": ..., "max_in_flight": ..., "available_tokens": ...}`
 
 ## 错误映射
 
@@ -32,16 +95,22 @@ tests/                单测 + 本地模拟上游（不依赖任何外部服务�
 | 上游 5xx                 | `upstream_5xx`            | 502         | 是     |
 | 熔断打开（快速失败）     | `circuit_open`            | 503         | 稍后   |
 | 本地限流拒绝             | `rate_limited`            | 429         | 稍后   |
+| 该上游并发名额已满       | `capacity_full`           | 503         | 稍后   |
+| 调用了未登记的上游       | `unknown_upstream`        | 404         | 否     |
+| 同一幂等键换了请求内容   | `idempotency_conflict`    | 409         | 否     |
 | 不支持的接口版本         | `version_unsupported`     | 400         | 否     |
+| 请求不符合所对接版本     | `invalid_request`         | 400         | 否     |
 | 响应字段缺失/结构不符    | `schema_mismatch`         | 502         | 否     |
+| 响应不是合法 JSON/非对象 | `invalid_response`        | 502         | 否     |
 | 未分类异常（兜底）       | `unknown`                 | 500         | 否     |
 
-底层异常类型名只放在内部 `detail` 字段，不出现在对外的 `error`/`message` 中。
+底层异常类型名只放在内部 `detail` 字段，不出现在对外的 `error`/`message` 中；
+JSON 解析等底层异常也绝不原样抛给调用方。
 
 ## 重试与熔断规则
 
 **重试**（`RetryPolicy`）：只对可重试错误（超时、连接失败、上游 5xx）重试，
-4xx 与 schema 问题不重试。退避公式
+4xx、请求/响应校验问题不重试。退避公式
 `min(max_delay, base_delay * 2^(n-1)) * (1 ± jitter)`，默认最多 3 次尝试。
 
 **熔断**（`CircuitBreaker`）三态切换：
@@ -54,7 +123,7 @@ tests/                单测 + 本地模拟上游（不依赖任何外部服务�
 
 所有状态迁移在同一把锁内完成，并发下状态不会被写乱；
 `time_func` 可注入假时钟，恢复重试时机完全可控（见单测）。
-限流（令牌桶）在熔断之前执行，被限流的请求不会打到上游。
+限流（令牌桶）与并发名额在熔断之前执行，被拦下的请求不会打到上游。
 
 ## 幂等
 
@@ -62,14 +131,24 @@ tests/                单测 + 本地模拟上游（不依赖任何外部服务�
 
 - 首个请求真正执行；执行期间的并发重复提交阻塞等待并拿到相同结论；
 - 完成后的结论（成功或失败）在 TTL（默认 300s）内缓存，重复提交直接复用；
+- **同一幂等键换了请求内容**（按规范化后的请求体指纹判断）不再默默复用旧
+  结论，而是返回 `idempotency_conflict`（HTTP 409）；冲突不会污染原键，
+  用原内容重复提交仍能拿到原结论；
 - 因此重试或重复提交不会造成重复副作用。
 
 ## 版本兼容
 
 - 支持上游接口版本 `v1`、`v2`；`X-Api-Version` 头缺省用 `v2`；
 - 不支持的版本直接返回 `version_unsupported`，不发请求；
-- 每个版本声明必填字段（v2 比 v1 多 `currency`），响应缺字段返回
-  `schema_mismatch` 并列出缺失字段，绝不默默取默认值；
+- **请求侧**：报文按所对接版本组装校验——
+  - v1 请求必填 `amount`，允许 `memo`，不支持 `currency`；
+  - v2 请求必填 `amount`、`currency`，允许 `memo`；
+  - 字段缺失或字段不被该版本支持都返回 `invalid_request`（HTTP 400），
+    并列出缺失/多余字段，请求不会打到上游；
+- **响应侧**：v1 响应必填 `id/status/amount`，v2 额外必填 `currency`；
+  缺字段返回 `schema_mismatch` 并列出缺失字段，绝不默默取默认值；
+  响应不是合法 JSON 或顶层不是对象返回 `invalid_response`，
+  与超时/4xx/5xx/`schema_mismatch` 都是可区分的类别；
 - 归一化输出显式携带 `version` 字段，v1 没有的字段不会出现在输出里。
 
 ## 验证方法
@@ -81,21 +160,32 @@ tests/                单测 + 本地模拟上游（不依赖任何外部服务�
 uv run pytest tests/ -v
 ```
 
-覆盖范围（`pytest -v` 可看到每个用例的通过情况）：
+`-v` 下每个用例打印 `[业务域] PASS 用例名`，会话结束按业务域汇总通过数。
+覆盖范围：
 
 - `tests/test_errors.py`：底层异常到各类错误的映射；
 - `tests/test_circuit_breaker.py`：三态切换、半开探针互斥、并发下状态一致性；
 - `tests/test_client.py`：正常调用、超时/连接失败/4xx/5xx 归类、重试恢复、
-  熔断快速失败与恢复、限流、幂等去重（含 20 并发同键只产生 1 次副作用）、
-  版本协商与字段缺失；
-- `tests/test_app.py`：HTTP 层统一错误体、状态码、幂等头、版本头。
+  熔断快速失败与恢复、限流、幂等去重（含 20 并发同键只产生 1 次副作用）；
+- `tests/test_concurrency.py`：并发名额——reject/wait 两种溢出策略、
+  成功/失败/中途放弃后名额正确归还、30 并发打 2 个名额不堆积；
+- `tests/test_registry.py`：多上游隔离——一个上游熔断/限流/占满名额/卡慢
+  不影响其他上游，健康状态逐上游分别上报；
+- `tests/test_semantics.py`：同幂等键换内容报冲突且不污染原键、
+  请求按 v1/v2 组装校验、非法 JSON/顶层非对象归 `invalid_response`、
+  缺字段仍归 `schema_mismatch`、解析异常不外泄；
+- `tests/test_app.py`：HTTP 层多上游路由、统一错误体、状态码、幂等头、
+  版本头、分上游健康端点。
 
-本地启动网关（上游地址用环境变量指定）：
+本地启动网关（多上游）：
 
 ```bash
-UPSTREAM_BASE_URL=http://127.0.0.1:9000 uv run python main.py
-curl -X POST localhost:8000/gateway/pay \
+export UPSTREAMS='{"pay": {"base_url": "http://127.0.0.1:9000"}}'
+uv run python main.py
+curl -X POST localhost:8000/gateway/pay/pay \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: order-123' -H 'X-Api-Version: v2' \
-  -d '{"amount": 100}'
+  -d '{"amount": 100, "currency": "CNY"}'
+curl localhost:8000/health        # 每个上游分别的状态
+curl localhost:8000/health/pay    # 单个上游的状态
 ```

@@ -26,6 +26,10 @@ from gateway.retry import RetryPolicy
 from tests.mock_upstream import MockUpstream
 
 
+PAYLOAD_V1 = {"amount": 100}
+PAYLOAD_V2 = {"amount": 100, "currency": "CNY"}
+
+
 def make_client(upstream: MockUpstream, **overrides) -> ResilientUpstreamClient:
     params = {
         "base_url": "http://mock",
@@ -49,7 +53,7 @@ class TestHappyPath:
     def test_normal_call_v1(self):
         up = MockUpstream()
         client = make_client(up)
-        result = client.call("/pay", version="v1")
+        result = client.call("/pay", version="v1", payload=PAYLOAD_V1)
         assert result["status"] == "ok"
         assert result["version"] == "v1"
         assert up.calls == 1
@@ -57,7 +61,7 @@ class TestHappyPath:
     def test_normal_call_v2_default_version(self):
         up = MockUpstream()
         client = make_client(up)
-        result = client.call("/pay")
+        result = client.call("/pay", payload=PAYLOAD_V2)
         assert result["version"] == "v2"
         assert result["currency"] == "CNY"
 
@@ -69,7 +73,7 @@ class TestFailureClassification:
         up = MockUpstream("timeout")
         client = make_client(up)
         with pytest.raises(UpstreamTimeoutError) as exc_info:
-            client.call("/pay")
+            client.call("/pay", payload=PAYLOAD_V2)
         assert exc_info.value.kind is ErrorKind.TIMEOUT
         assert up.calls == 3  # 重试到上限
 
@@ -77,7 +81,7 @@ class TestFailureClassification:
         up = MockUpstream("conn_error")
         client = make_client(up)
         with pytest.raises(UpstreamConnectionError) as exc_info:
-            client.call("/pay")
+            client.call("/pay", payload=PAYLOAD_V2)
         assert exc_info.value.kind is ErrorKind.CONNECTION
         assert "ConnectError" not in str(exc_info.value)  # 不透出底层异常名
 
@@ -85,7 +89,7 @@ class TestFailureClassification:
         up = MockUpstream("bad_request")
         client = make_client(up)
         with pytest.raises(UpstreamClientError) as exc_info:
-            client.call("/pay")
+            client.call("/pay", payload=PAYLOAD_V2)
         assert exc_info.value.kind is ErrorKind.UPSTREAM_CLIENT_ERROR
         assert exc_info.value.retryable is False
         assert up.calls == 1  # 4xx 不重试
@@ -94,14 +98,14 @@ class TestFailureClassification:
         up = MockUpstream("server_error")
         client = make_client(up)
         with pytest.raises(UpstreamServerError) as exc_info:
-            client.call("/pay")
+            client.call("/pay", payload=PAYLOAD_V2)
         assert exc_info.value.kind is ErrorKind.UPSTREAM_SERVER_ERROR
         assert up.calls == 3
 
     def test_flaky_upstream_recovers_via_retry(self):
         up = MockUpstream("flaky", flaky_failures=2)
         client = make_client(up)
-        result = client.call("/pay")
+        result = client.call("/pay", payload=PAYLOAD_V2)
         assert result["status"] == "ok"
         assert up.calls == 3  # 2 次失败 + 第 3 次成功
 
@@ -109,7 +113,7 @@ class TestFailureClassification:
         up = MockUpstream("missing_field")
         client = make_client(up)
         with pytest.raises(SchemaMismatchError) as exc_info:
-            client.call("/pay")
+            client.call("/pay", payload=PAYLOAD_V2)
         assert "amount" in exc_info.value.message
         assert up.calls == 1  # 结构问题不重试
 
@@ -130,11 +134,11 @@ class TestCircuitBreakerIntegration:
                              retry_policy=RetryPolicy(max_attempts=1))
         for _ in range(2):
             with pytest.raises(UpstreamServerError):
-                client.call("/pay")
+                client.call("/pay", payload=PAYLOAD_V2)
         assert cb.state is CircuitState.OPEN
         calls_before = up.calls
         with pytest.raises(CircuitOpenError):
-            client.call("/pay")
+            client.call("/pay", payload=PAYLOAD_V2)
         assert up.calls == calls_before  # 熔断期间不打到上游
 
     def test_circuit_recovers_after_timeout(self):
@@ -146,10 +150,10 @@ class TestCircuitBreakerIntegration:
                              retry_policy=RetryPolicy(max_attempts=1))
         for _ in range(2):
             with pytest.raises(UpstreamServerError):
-                client.call("/pay")
+                client.call("/pay", payload=PAYLOAD_V2)
         assert cb.state is CircuitState.OPEN
         clock.now += 10.0  # 恢复时机由注入时钟控制
-        result = client.call("/pay")  # 半开探针成功
+        result = client.call("/pay", payload=PAYLOAD_V2)  # 半开探针成功
         assert result["status"] == "ok"
         assert cb.state is CircuitState.CLOSED
 
@@ -162,7 +166,7 @@ class TestCircuitBreakerIntegration:
 
         def worker():
             try:
-                client.call("/pay")
+                client.call("/pay", payload=PAYLOAD_V2)
             except Exception as exc:  # noqa: BLE001 - 收集所有结论
                 errors.append(exc)
 
@@ -182,22 +186,22 @@ class TestRateLimiting:
         clock = FakeClock()
         limiter = TokenBucketRateLimiter(rate=1.0, capacity=2.0, time_func=clock)
         client = make_client(up, rate_limiter=limiter)
-        client.call("/pay")
-        client.call("/pay")
+        client.call("/pay", payload=PAYLOAD_V2)
+        client.call("/pay", payload=PAYLOAD_V2)
         with pytest.raises(RateLimitedError) as exc_info:
-            client.call("/pay")
+            client.call("/pay", payload=PAYLOAD_V2)
         assert exc_info.value.kind is ErrorKind.RATE_LIMITED
         assert up.calls == 2  # 被限流的请求没打到上游
         clock.now += 1.0     # 令牌补充后恢复
-        assert client.call("/pay")["status"] == "ok"
+        assert client.call("/pay", payload=PAYLOAD_V2)["status"] == "ok"
 
 
 class TestIdempotency:
     def test_duplicate_key_returns_same_result_without_second_call(self):
         up = MockUpstream()
         client = make_client(up)
-        r1 = client.call("/pay", idempotency_key="order-1")
-        r2 = client.call("/pay", idempotency_key="order-1")
+        r1 = client.call("/pay", payload=PAYLOAD_V2, idempotency_key="order-1")
+        r2 = client.call("/pay", payload=PAYLOAD_V2, idempotency_key="order-1")
         assert r1 == r2
         assert up.calls == 1  # 重复提交不产生第二次副作用
 
@@ -205,9 +209,9 @@ class TestIdempotency:
         up = MockUpstream("bad_request")
         client = make_client(up)
         with pytest.raises(UpstreamClientError):
-            client.call("/pay", idempotency_key="order-2")
+            client.call("/pay", payload=PAYLOAD_V2, idempotency_key="order-2")
         with pytest.raises(UpstreamClientError):
-            client.call("/pay", idempotency_key="order-2")
+            client.call("/pay", payload=PAYLOAD_V2, idempotency_key="order-2")
         assert up.calls == 1
 
     def test_concurrent_duplicate_keys_cause_single_side_effect(self):
@@ -217,7 +221,7 @@ class TestIdempotency:
 
         def worker():
             try:
-                results.append(client.call("/pay", idempotency_key="order-3"))
+                results.append(client.call("/pay", payload=PAYLOAD_V2, idempotency_key="order-3"))
             except Exception as exc:  # noqa: BLE001
                 errors.append(exc)
 

@@ -7,20 +7,31 @@
 - bad_request    返回 400
 - server_error   返回 500
 - missing_field  返回 200 但缺少必填字段
+- invalid_json   返回 200 但响应体不是合法 JSON
+- not_object     返回 200 且是合法 JSON，但顶层不是对象（数组）
+- slow           正常返回，但每次调用阻塞 slow_delay 秒（模拟慢上游）
 - flaky          前 flaky_failures 次返回 500，之后恢复正常
 """
 
 from __future__ import annotations
 
 import threading
+import time
 
 import httpx
 
 
 class MockUpstream:
-    def __init__(self, scenario: str = "ok", *, flaky_failures: int = 0) -> None:
+    def __init__(
+        self,
+        scenario: str = "ok",
+        *,
+        flaky_failures: int = 0,
+        slow_delay: float = 0.0,
+    ) -> None:
         self.scenario = scenario
         self.flaky_failures = flaky_failures
+        self.slow_delay = slow_delay
         self.calls = 0
         self._lock = threading.Lock()
 
@@ -43,6 +54,14 @@ class MockUpstream:
             return httpx.Response(500, json={"upstream_error": "boom"})
         if self.scenario == "missing_field":
             return httpx.Response(200, json={"id": "tx-1", "status": "ok"})  # 缺 amount 等
+        if self.scenario == "invalid_json":
+            return httpx.Response(200, content=b"<html>not json</html>",
+                                  headers={"Content-Type": "text/html"})
+        if self.scenario == "not_object":
+            return httpx.Response(200, json=["tx-1", "tx-2"])
+        if self.scenario == "slow":
+            time.sleep(self.slow_delay)
+            return self._ok(request)
         if self.scenario == "flaky":
             if call_no <= self.flaky_failures:
                 return httpx.Response(500, json={"upstream_error": "boom"})

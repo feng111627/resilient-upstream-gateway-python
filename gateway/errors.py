@@ -14,8 +14,13 @@ class ErrorKind(enum.Enum):
     UPSTREAM_SERVER_ERROR = "upstream_5xx" # 上游 5xx（上游故障，可重试）
     CIRCUIT_OPEN = "circuit_open"          # 熔断打开，快速失败
     RATE_LIMITED = "rate_limited"          # 本地限流拒绝
+    CAPACITY_FULL = "capacity_full"        # 该上游并发名额已满（太忙），与超时/熔断可区分
+    UNKNOWN_UPSTREAM = "unknown_upstream"  # 调用了未登记的上游名称
+    IDEMPOTENCY_CONFLICT = "idempotency_conflict"  # 同一幂等键换了请求内容
     VERSION_UNSUPPORTED = "version_unsupported"  # 不支持的接口版本
+    INVALID_REQUEST = "invalid_request"      # 请求报文不符合所对接版本的要求
     SCHEMA_MISMATCH = "schema_mismatch"    # 响应字段缺失/版本差异无法兼容
+    INVALID_RESPONSE = "invalid_response"  # 上游返回不是合法 JSON / 结构完全对不上
     UNKNOWN = "unknown"                    # 兜底
 
 
@@ -80,13 +85,48 @@ class RateLimitedError(GatewayError):
     retryable = True
 
 
+class CapacityFullError(GatewayError):
+    """该上游同时在飞的请求已达配置上限：明确与超时/熔断区分开的“太忙”结论。"""
+
+    kind = ErrorKind.CAPACITY_FULL
+    retryable = True  # 稍后名额释放即可成功，但不应立即无脑重试
+
+
+class UnknownUpstreamError(GatewayError):
+    """调用了未登记的上游名称。"""
+
+    kind = ErrorKind.UNKNOWN_UPSTREAM
+    retryable = False
+
+
+class IdempotencyConflictError(GatewayError):
+    """同一幂等键携带了不同的请求内容：拒绝默默复用旧结论。"""
+
+    kind = ErrorKind.IDEMPOTENCY_CONFLICT
+    retryable = False
+
+
 class VersionUnsupportedError(GatewayError):
     kind = ErrorKind.VERSION_UNSUPPORTED
     retryable = False
 
 
+class InvalidRequestError(GatewayError):
+    """请求报文不符合所对接版本的要求（字段缺失/字段不被该版本支持）。"""
+
+    kind = ErrorKind.INVALID_REQUEST
+    retryable = False
+
+
 class SchemaMismatchError(GatewayError):
     kind = ErrorKind.SCHEMA_MISMATCH
+    retryable = False
+
+
+class InvalidResponseError(GatewayError):
+    """上游返回的不是合法 JSON，或顶层结构完全对不上：解析层面的独立结论。"""
+
+    kind = ErrorKind.INVALID_RESPONSE
     retryable = False
 
 
