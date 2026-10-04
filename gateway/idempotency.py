@@ -5,6 +5,8 @@
 - 执行期间到达的重复请求阻塞等待 owner 的结论，然后拿到相同结果/错误。
 - owner 完成后结论在 TTL 内被缓存，之后的重复提交直接返回缓存结论。
 - 结论（成功或失败）都会被缓存，保证重复提交得到一致的明确结论。
+- 同一幂等键若换了请求内容（fingerprint 不一致），不再默默复用旧结论，
+  而是直接抛 IdempotencyConflictError，要求调用方显式处理。
 
 线程安全：所有状态变更在锁内完成，等待使用 Event，避免惊群与竞态。
 """
@@ -15,6 +17,8 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
+
+from .errors import IdempotencyConflictError
 
 
 @dataclass(frozen=True)
@@ -27,14 +31,15 @@ class Claim:
 
 
 class _Entry:
-    __slots__ = ("done", "event", "result", "error", "expires_at")
+    __slots__ = ("done", "event", "result", "error", "expires_at", "fingerprint")
 
-    def __init__(self, expires_at: float) -> None:
+    def __init__(self, expires_at: float, fingerprint: str | None) -> None:
         self.done = False
         self.event = threading.Event()
         self.result: Any = None
         self.error: BaseException | None = None
         self.expires_at = expires_at
+        self.fingerprint = fingerprint
 
 
 class IdempotencyStore:
@@ -46,8 +51,12 @@ class IdempotencyStore:
         self._lock = threading.Lock()
         self._entries: dict[str, _Entry] = {}
 
-    def begin(self, key: str) -> Claim:
-        """登记幂等键。owner 负责执行并调用 complete/fail；非 owner 等待结论。"""
+    def begin(self, key: str, fingerprint: str | None = None) -> Claim:
+        """登记幂等键。owner 负责执行并调用 complete/fail；非 owner 等待结论。
+
+        同一 key 已有记录（执行中或已完成且未过期）但 fingerprint 不一致时，
+        抛 IdempotencyConflictError——绝不把旧请求的结论复用给新内容。
+        """
         if not key:
             raise ValueError("幂等键不能为空")
         while True:
@@ -55,9 +64,15 @@ class IdempotencyStore:
                 self._purge_expired()
                 entry = self._entries.get(key)
                 if entry is None:
-                    entry = _Entry(self._time() + self._ttl)
+                    entry = _Entry(self._time() + self._ttl, fingerprint)
                     self._entries[key] = entry
                     return Claim(is_owner=True)
+                if entry.fingerprint != fingerprint:
+                    raise IdempotencyConflictError(
+                        f"幂等键 {key!r} 已绑定其他请求内容，"
+                        "同键换内容必须使用新的幂等键",
+                        detail={"idempotency_key": key},
+                    )
                 if entry.done:
                     return Claim(is_owner=False, result=entry.result, error=entry.error)
                 event = entry.event

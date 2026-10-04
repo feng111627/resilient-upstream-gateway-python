@@ -14,8 +14,13 @@ class ErrorKind(enum.Enum):
     UPSTREAM_SERVER_ERROR = "upstream_5xx" # 上游 5xx（上游故障，可重试）
     CIRCUIT_OPEN = "circuit_open"          # 熔断打开，快速失败
     RATE_LIMITED = "rate_limited"          # 本地限流拒绝
+    CAPACITY_FULL = "capacity_full"        # 该上游并发名额满/太忙（区别于超时、熔断）
+    IDEMPOTENCY_CONFLICT = "idempotency_conflict"  # 同幂等键换了请求内容
     VERSION_UNSUPPORTED = "version_unsupported"  # 不支持的接口版本
+    REQUEST_INVALID = "request_invalid"    # 请求报文不符合该版本要求（缺字段/字段不支持）
+    INVALID_JSON = "invalid_json"          # 上游返回的不是合法 JSON
     SCHEMA_MISMATCH = "schema_mismatch"    # 响应字段缺失/版本差异无法兼容
+    UPSTREAM_NOT_FOUND = "upstream_not_found"  # 指定名字的上游未登记
     UNKNOWN = "unknown"                    # 兜底
 
 
@@ -80,13 +85,48 @@ class RateLimitedError(GatewayError):
     retryable = True
 
 
+class CapacityFullError(GatewayError):
+    """该上游并发名额已满（隔离舱拒绝）：和超时、熔断是不同结论。"""
+
+    kind = ErrorKind.CAPACITY_FULL
+    retryable = True
+
+
+class IdempotencyConflictError(GatewayError):
+    """同一幂等键此前已用于不同请求内容，不能复用旧结论。"""
+
+    kind = ErrorKind.IDEMPOTENCY_CONFLICT
+    retryable = False
+
+
 class VersionUnsupportedError(GatewayError):
     kind = ErrorKind.VERSION_UNSUPPORTED
     retryable = False
 
 
+class RequestInvalidError(GatewayError):
+    """请求报文不符合目标版本要求：缺必填字段，或带了该版本不支持的字段。"""
+
+    kind = ErrorKind.REQUEST_INVALID
+    retryable = False
+
+
+class InvalidJsonError(GatewayError):
+    """上游 HTTP 成功/错误响应体不是合法 JSON，区别于超时与 4xx/5xx 状态码。"""
+
+    kind = ErrorKind.INVALID_JSON
+    retryable = False
+
+
 class SchemaMismatchError(GatewayError):
     kind = ErrorKind.SCHEMA_MISMATCH
+    retryable = False
+
+
+class UpstreamNotFoundError(GatewayError):
+    """调用方指定了未登记的上游名字。"""
+
+    kind = ErrorKind.UPSTREAM_NOT_FOUND
     retryable = False
 
 
