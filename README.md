@@ -18,7 +18,8 @@ gateway/
   versioning.py       版本协商 + 请求按版本组装校验 + 响应 schema 校验
   client.py           ResilientUpstreamClient：以上能力的组合（单上游）
   registry.py         多上游注册表：按名字路由，配置与状态逐上游隔离
-main.py               FastAPI 入口：POST /gateway/{upstream}/{path}
+main.py               FastAPI 入口：POST /gateway/{upstream}/{path}（新）
+                      与 POST /gateway/{path}（单上游老路径，继续可用）
 tests/                单测 + 本地模拟上游（不依赖任何外部服务）
 ```
 
@@ -65,6 +66,32 @@ registry.register(UpstreamConfig(name="risk", base_url="http://risk:9002",
 registry.call("pay", "/pay", payload={"amount": 100, "currency": "CNY"})
 ```
 
+也可以把调用方自己按老方式构造的客户端直接登记进来（见下文“向后兼容”）：
+
+```python
+registry.register_client("pay", your_client)
+# 或一步到位
+registry = UpstreamRegistry.with_client("default", your_client)
+```
+
+## 向后兼容（单上游老调用方式不丢）
+
+多上游是在旁边新增能力，不顶掉原来的用法：
+
+- **老式注入照常可用**：单上游时代直接
+  `create_app(ResilientUpstreamClient(base_url=...))` 的构造/注入方式保留，
+  该客户端会被包成名为 `default` 的唯一上游，行为与升级前一致。
+- **老 HTTP 路径保留**：`POST /gateway/{path}`（含 `/gateway/orders/create`
+  这类多段老路径）仍然可用，路由到 `default` 上游。它与新路径
+  `POST /gateway/{upstream}/{path}` 在同一个入口上按第一段是否为**已登记的
+  上游名**消歧：命中才按多上游解析，否则整段都当老路径。因此只要不把上游
+  起名成业务路径的第一段，两种调用方式互不干扰；注册表里没有 `default` 时，
+  老路径会得到明确的 `unknown_upstream`（HTTP 404），而不是行为错乱。
+- **老健康字段保留**：存在 `default` 上游时，`GET /health` 除了新的
+  `upstreams` 分上游视图，还带老版本的顶层 `circuit` 字段。
+- **直接使用 `ResilientUpstreamClient` 的代码无需改动**：构造签名保持兼容，
+  仅新增了可选的 `name` 参数（由注册表登记时自动回填）。
+
 ## 隔离与配额规则
 
 - **逐上游独立组件**：每个上游独享 httpx 客户端（独立地址/超时）、重试策略、
@@ -107,10 +134,17 @@ registry.call("pay", "/pay", payload={"amount": 100, "currency": "CNY"})
 底层异常类型名只放在内部 `detail` 字段，不出现在对外的 `error`/`message` 中；
 JSON 解析等底层异常也绝不原样抛给调用方。
 
+**非法响应的判定先于状态码**：只要响应体压根不是合法 JSON（比如上游直接
+甩回一坨 HTML 错误页），或顶层不是 JSON 对象，无论它的 HTTP 状态码是多少
+——哪怕顶着 500——都归为独立的 `invalid_response`（HTTP 502），**不会被当成
+上游 5xx 反复重试**，也不计入熔断失败。它与超时、连接失败、4xx、5xx、
+`schema_mismatch`（结构对得上但缺字段）都是互不混淆的结论。
+
 ## 重试与熔断规则
 
 **重试**（`RetryPolicy`）：只对可重试错误（超时、连接失败、上游 5xx）重试，
-4xx、请求/响应校验问题不重试。退避公式
+4xx、请求/响应校验问题（`invalid_request` / `schema_mismatch` /
+`invalid_response`，包括顶着 5xx 的 HTML 错误页）一律不重试。退避公式
 `min(max_delay, base_delay * 2^(n-1)) * (1 ± jitter)`，默认最多 3 次尝试。
 
 **熔断**（`CircuitBreaker`）三态切换：
@@ -131,10 +165,16 @@ JSON 解析等底层异常也绝不原样抛给调用方。
 
 - 首个请求真正执行；执行期间的并发重复提交阻塞等待并拿到相同结论；
 - 完成后的结论（成功或失败）在 TTL（默认 300s）内缓存，重复提交直接复用；
-- **同一幂等键换了请求内容**（按规范化后的请求体指纹判断）不再默默复用旧
-  结论，而是返回 `idempotency_conflict`（HTTP 409）；冲突不会污染原键，
-  用原内容重复提交仍能拿到原结论；
+- **冲突判定覆盖整个请求身份**，指纹 = 目标上游 + 目标接口(path) + 接口版本
+  + 请求报文（规范化 JSON）。同一幂等键只要换了其中任意一项——换上游、换接口、
+  换版本（未指定版本与显式指定默认版本视为同一份请求）、换报文——都明确返回
+  `idempotency_conflict`（HTTP 409），绝不默默把上一次的结论丢回来；
+- 冲突请求不会打到上游，也不会污染原键：报过冲突之后，用原来的完整请求
+  重复提交仍能拿到原结论；owner 执行期间并发撞入的不同请求会等待 owner
+  结论落定后再报冲突，并发下不会把原结论弄坏；
 - 因此重试或重复提交不会造成重复副作用。
+- 每个上游默认独享幂等存储（跨上游天然隔离）；若显式给多个客户端注入同一
+  存储，指纹里包含上游名，同键跨上游仍会判冲突而不是串结论。
 
 ## 版本兼容
 
@@ -147,9 +187,17 @@ JSON 解析等底层异常也绝不原样抛给调用方。
     并列出缺失/多余字段，请求不会打到上游；
 - **响应侧**：v1 响应必填 `id/status/amount`，v2 额外必填 `currency`；
   缺字段返回 `schema_mismatch` 并列出缺失字段，绝不默默取默认值；
-  响应不是合法 JSON 或顶层不是对象返回 `invalid_response`，
-  与超时/4xx/5xx/`schema_mismatch` 都是可区分的类别；
+  响应不是合法 JSON 或顶层不是对象返回 `invalid_response`（与状态码无关，
+  顶着 5xx 的 HTML 错误页同样如此，且不重试），与超时/4xx/5xx/
+  `schema_mismatch` 都是可区分的类别；
 - 归一化输出显式携带 `version` 字段，v1 没有的字段不会出现在输出里。
+
+请求/响应兼容范围一览：
+
+| 版本 | 请求必填 | 请求允许 | 响应必填 | 响应可选 |
+|------|----------|----------|----------|----------|
+| v1 | `amount` | `amount`, `memo` | `id`, `status`, `amount` | — |
+| v2（默认） | `amount`, `currency` | `amount`, `currency`, `memo` | `id`, `status`, `amount`, `currency` | `memo` |
 
 ## 验证方法
 
@@ -168,14 +216,19 @@ uv run pytest tests/ -v
 - `tests/test_client.py`：正常调用、超时/连接失败/4xx/5xx 归类、重试恢复、
   熔断快速失败与恢复、限流、幂等去重（含 20 并发同键只产生 1 次副作用）；
 - `tests/test_concurrency.py`：并发名额——reject/wait 两种溢出策略、
-  成功/失败/中途放弃后名额正确归还、30 并发打 2 个名额不堆积；
+  成功/失败（非法 JSON/结构缺失/4xx/超时）/中途放弃/等待超时放弃后名额
+  正确归还、30 并发打 2 个名额不堆积；
 - `tests/test_registry.py`：多上游隔离——一个上游熔断/限流/占满名额/卡慢
-  不影响其他上游，健康状态逐上游分别上报；
-- `tests/test_semantics.py`：同幂等键换内容报冲突且不污染原键、
-  请求按 v1/v2 组装校验、非法 JSON/顶层非对象归 `invalid_response`、
-  缺字段仍归 `schema_mismatch`、解析异常不外泄；
+  不影响其他上游，同幂等键跨上游各执行一次/共享存储时跨上游报冲突，
+  同键换接口/换版本/换报文在注册表入口报冲突，老式客户端登记可用，
+  健康状态逐上游分别上报；
+- `tests/test_semantics.py`：同幂等键换接口/换版本/换报文报冲突且不污染
+  原键（含 owner 执行期间并发撞入）、请求按 v1/v2 组装校验、
+  非法 JSON/顶层非对象归 `invalid_response`、顶着 5xx 的 HTML 错误页同样归
+  `invalid_response` 且不重试、缺字段仍归 `schema_mismatch`、解析异常不外泄；
 - `tests/test_app.py`：HTTP 层多上游路由、统一错误体、状态码、幂等头、
-  版本头、分上游健康端点。
+  版本头、分上游健康端点，以及单上游老路径/老式客户端注入/老健康字段的
+  向后兼容验证。
 
 本地启动网关（多上游）：
 
@@ -188,4 +241,14 @@ curl -X POST localhost:8000/gateway/pay/pay \
   -d '{"amount": 100, "currency": "CNY"}'
 curl localhost:8000/health        # 每个上游分别的状态
 curl localhost:8000/health/pay    # 单个上游的状态
+```
+
+本地启动网关（单上游老方式，路由与注入都不变）：
+
+```bash
+export UPSTREAM_BASE_URL='http://127.0.0.1:9000'   # 不设 UPSTREAMS 即回退
+uv run python main.py
+curl -X POST localhost:8000/gateway/pay \
+  -H 'Content-Type: application/json' \
+  -d '{"amount": 100, "currency": "CNY"}'          # 老路径照常可用
 ```

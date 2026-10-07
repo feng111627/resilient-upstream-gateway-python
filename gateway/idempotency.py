@@ -5,20 +5,45 @@
 - 执行期间到达的重复请求阻塞等待 owner 的结论，然后拿到相同结果/错误。
 - owner 完成后结论在 TTL 内被缓存，之后的重复提交直接返回缓存结论。
 - 结论（成功或失败）都会被缓存，保证重复提交得到一致的明确结论。
-- 调用方可提供请求指纹（fingerprint）：同一幂等键换了请求内容时
-  明确抛 IdempotencyConflictError，绝不默默复用旧结论。
+- 调用方提供请求指纹（fingerprint，由 request_fingerprint() 覆盖
+  目标上游/接口/版本/报文整个请求身份生成）：同一幂等键换了请求的
+  任何一项都明确抛 IdempotencyConflictError，绝不默默复用旧结论。
 
 线程安全：所有状态变更在锁内完成，等待使用 Event，避免惊群与竞态。
 """
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from .errors import IdempotencyConflictError
+
+
+def request_fingerprint(
+    *,
+    upstream: str | None,
+    path: str,
+    version: str,
+    payload: dict | None,
+) -> str:
+    """构造覆盖整个请求身份的指纹。
+
+    指纹范围 = 目标上游 + 目标接口(path) + 接口版本 + 请求报文；
+    其中任何一项不同（换上游/换接口/换版本/换报文），指纹就不同，
+    同一幂等键再次提交必须明确报冲突，而不是复用旧结论。
+    version 取协商后的实际版本，保证 None 与显式默认版本算同一份请求。
+    """
+    material = {
+        "upstream": upstream,
+        "path": path,
+        "version": version,
+        "payload": payload or {},
+    }
+    return json.dumps(material, sort_keys=True, default=str, separators=(",", ":"))
 
 
 @dataclass(frozen=True)
@@ -54,9 +79,9 @@ class IdempotencyStore:
     def begin(self, key: str, *, fingerprint: str | None = None) -> Claim:
         """登记幂等键。owner 负责执行并调用 complete/fail；非 owner 等待结论。
 
-        fingerprint 是请求内容的指纹（如规范化 JSON 的哈希）。同一键的后续
-        提交若指纹不同，说明换了请求内容，明确抛 IdempotencyConflictError，
-        而不是把旧结论复用回去。
+        fingerprint 是整个请求身份的指纹（request_fingerprint：上游+接口+
+        版本+报文）。同一键的后续提交若指纹不同，说明换了请求，明确抛
+        IdempotencyConflictError，而不是把旧结论复用回去。
         """
         if not key:
             raise ValueError("幂等键不能为空")

@@ -13,6 +13,7 @@ from gateway.errors import (
     UpstreamServerError,
 )
 from gateway.registry import UpstreamConfig, UpstreamRegistry
+from gateway.retry import RetryPolicy
 from tests.mock_upstream import MockUpstream
 
 PAYLOAD_V2 = {"amount": 100, "currency": "CNY"}
@@ -55,6 +56,94 @@ class TestRegistration:
 
 
 class TestIsolation:
+    def test_same_idempotency_key_on_different_upstreams_executes_twice(self):
+        """同一幂等键打到两个不同上游：是两次不同的请求，互不影响、各执行一次。"""
+        a, b = MockUpstream(), MockUpstream()
+        registry = make_registry(alpha=a, beta=b)
+        r_a = registry.call("alpha", "/pay", payload=PAYLOAD_V2, idempotency_key="dup-key")
+        r_b = registry.call("beta", "/pay", payload=PAYLOAD_V2, idempotency_key="dup-key")
+        assert r_a["status"] == r_b["status"] == "ok"
+        assert a.calls == 1 and b.calls == 1  # 没有跨上游复用结论
+        # 各自内部重复提交仍然复用
+        registry.call("alpha", "/pay", payload=PAYLOAD_V2, idempotency_key="dup-key")
+        registry.call("beta", "/pay", payload=PAYLOAD_V2, idempotency_key="dup-key")
+        assert a.calls == 1 and b.calls == 1
+
+    def test_shared_idempotency_store_conflicts_across_upstreams(self):
+        """显式共享同一个幂等存储时（如外置 Redis 场景），指纹包含上游名，
+        同键打不同上游会明确报冲突，而不是把 A 的结论丢给 B。"""
+        from gateway.client import ResilientUpstreamClient
+        from gateway.errors import IdempotencyConflictError
+        from gateway.idempotency import IdempotencyStore
+
+        a, b = MockUpstream(), MockUpstream()
+        shared = IdempotencyStore()
+        client_a = ResilientUpstreamClient(
+            base_url="http://alpha", name="alpha", transport=a.transport,
+            retry_policy=RetryPolicy(max_attempts=1), idempotency_store=shared,
+            sleep_func=lambda _: None,
+        )
+        client_b = ResilientUpstreamClient(
+            base_url="http://beta", name="beta", transport=b.transport,
+            retry_policy=RetryPolicy(max_attempts=1), idempotency_store=shared,
+            sleep_func=lambda _: None,
+        )
+        registry = UpstreamRegistry()
+        registry.register_client("alpha", client_a)
+        registry.register_client("beta", client_b)
+        assert registry.call("alpha", "/pay", payload=PAYLOAD_V2,
+                             idempotency_key="shared-key")["status"] == "ok"
+        with pytest.raises(IdempotencyConflictError):
+            registry.call("beta", "/pay", payload=PAYLOAD_V2,
+                          idempotency_key="shared-key")
+        assert a.calls == 1 and b.calls == 0
+        # 原键在 alpha 上的结论没被弄坏
+        assert registry.call("alpha", "/pay", payload=PAYLOAD_V2,
+                             idempotency_key="shared-key")["status"] == "ok"
+        assert a.calls == 1
+
+    def test_same_key_switching_path_or_version_on_one_upstream_conflicts(self):
+        """注册表入口上，同键换接口/换版本同样明确报冲突、不打上游。"""
+        from gateway.errors import IdempotencyConflictError
+
+        up = MockUpstream()
+        registry = UpstreamRegistry()
+        registry.register(
+            UpstreamConfig(name="pay", base_url="http://pay", transport=up.transport,
+                           max_attempts=1, sleep_func=lambda _: None))
+        registry.call("pay", "/orders/create", payload=PAYLOAD_V2, idempotency_key="biz-1")
+        with pytest.raises(IdempotencyConflictError):  # 换接口
+            registry.call("pay", "/refund/create", payload=PAYLOAD_V2, idempotency_key="biz-1")
+        with pytest.raises(IdempotencyConflictError):  # 换版本
+            registry.call("pay", "/orders/create", version="v1",
+                          payload={"amount": 100}, idempotency_key="biz-1")
+        with pytest.raises(IdempotencyConflictError):  # 换报文
+            registry.call("pay", "/orders/create",
+                          payload={"amount": 200, "currency": "CNY"},
+                          idempotency_key="biz-1")
+        assert up.calls == 1  # 三次冲突提交都没打到上游
+        # 原请求重复提交仍复用
+        assert registry.call("pay", "/orders/create", payload=PAYLOAD_V2,
+                             idempotency_key="biz-1")["status"] == "ok"
+        assert up.calls == 1
+
+    def test_register_externally_built_client_routes_and_reports_health(self):
+        """老式构造的客户端登记进注册表：按名路由、健康状态都正常。"""
+        from gateway.client import ResilientUpstreamClient
+
+        up = MockUpstream()
+        client = ResilientUpstreamClient(
+            base_url="http://legacy", transport=up.transport,
+            sleep_func=lambda _: None,
+        )
+        registry = UpstreamRegistry()
+        registry.register_client("legacy", client)
+        assert registry.names() == ["legacy"]
+        assert registry.call("legacy", "/pay", payload=PAYLOAD_V2)["status"] == "ok"
+        health = registry.health("legacy")
+        assert health["circuit"] == CircuitState.CLOSED.value
+        assert health["max_in_flight"] is None  # 老客户端没配舱壁，不报假数据
+
     def test_circuit_of_one_upstream_does_not_affect_others(self):
         bad, good = MockUpstream("server_error"), MockUpstream()
         registry = UpstreamRegistry()

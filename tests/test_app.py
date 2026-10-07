@@ -5,7 +5,9 @@
 
 from fastapi.testclient import TestClient
 
+from gateway.client import ResilientUpstreamClient
 from gateway.registry import UpstreamConfig, UpstreamRegistry
+from gateway.retry import RetryPolicy
 from main import create_app
 from tests.mock_upstream import MockUpstream
 
@@ -69,6 +71,21 @@ class TestHttpGateway:
         assert resp.status_code == 502
         assert resp.json()["error"] == "upstream_5xx"
 
+    def test_5xx_html_error_page_is_invalid_response_not_retried(self):
+        tc, upstream = make_test_client("html_5xx")
+        resp = tc.post(f"/gateway/{UP}/pay", json=PAYLOAD_V2)
+        assert resp.status_code == 502
+        body = resp.json()
+        assert body["error"] == "invalid_response"
+        assert body["retryable"] is False
+        assert upstream.calls == 1  # 顶着 5xx 也不重试
+
+    def test_invalid_json_200_returns_invalid_response(self):
+        tc, _ = make_test_client("invalid_json")
+        resp = tc.post(f"/gateway/{UP}/pay", json=PAYLOAD_V2)
+        assert resp.status_code == 502
+        assert resp.json()["error"] == "invalid_response"
+
     def test_idempotency_key_header_dedupes(self):
         tc, upstream = make_test_client()
         r1 = tc.post(f"/gateway/{UP}/pay", json=PAYLOAD_V2, headers={"Idempotency-Key": "k-1"})
@@ -118,3 +135,84 @@ class TestHttpGateway:
         assert resp.json()["circuit"] == "closed"
         resp = tc.get("/health/ghost")
         assert resp.status_code == 404
+
+
+def make_legacy_client(scenario: str = "ok") -> tuple[TestClient, MockUpstream]:
+    """单上游时代的构造与注入方式：直接 new ResilientUpstreamClient 传给 create_app。"""
+    upstream = MockUpstream(scenario)
+    client = ResilientUpstreamClient(
+        base_url="http://legacy",
+        transport=upstream.transport,
+        retry_policy=RetryPolicy(max_attempts=2, base_delay=0.01, jitter=0.0),
+        sleep_func=lambda _: None,
+    )
+    return TestClient(create_app(client), raise_server_exceptions=False), upstream
+
+
+class TestBackwardCompatibility:
+    """升级多上游后，单上游时代的调用路径与注入方式必须照常可用。"""
+
+    def test_legacy_client_injection_proxies(self):
+        tc, upstream = make_legacy_client()
+        resp = tc.post("/gateway/pay", json=PAYLOAD_V2)
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "ok"
+        assert upstream.calls == 1
+
+    def test_legacy_client_unified_error_body_unchanged(self):
+        tc, _ = make_legacy_client("timeout")
+        resp = tc.post("/gateway/pay", json=PAYLOAD_V2)
+        assert resp.status_code == 504
+        assert resp.json() == {
+            "error": "timeout", "message": "上游调用超时", "retryable": True}
+
+    def test_legacy_headers_still_work(self):
+        tc, upstream = make_legacy_client()
+        resp = tc.post(
+            "/gateway/pay", json={"amount": 100},
+            headers={"Idempotency-Key": "leg-1", "X-Api-Version": "v1"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["version"] == "v1"
+        resp = tc.post(
+            "/gateway/pay", json={"amount": 100},
+            headers={"Idempotency-Key": "leg-1", "X-Api-Version": "v1"},
+        )
+        assert resp.status_code == 200
+        assert upstream.calls == 1  # 幂等头照旧生效
+
+    def test_legacy_multisegment_path_not_mistaken_for_upstream(self):
+        """老路径多段（/gateway/orders/create）不会被误当成 上游名/接口。"""
+        tc, _ = make_legacy_client()
+        resp = tc.post("/gateway/orders/create", json=PAYLOAD_V2)
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "ok"
+
+    def test_legacy_health_has_top_level_circuit_and_upstreams(self):
+        tc, _ = make_legacy_client()
+        resp = tc.get("/health")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["circuit"] == "closed"  # 老字段保留
+        assert body["upstreams"]["default"]["circuit"] == "closed"  # 新视图也在
+
+    def test_named_routing_and_legacy_path_coexist(self):
+        """多上游注册表里存在 default 时：新路由按名走，老路径走 default。"""
+        default_up = MockUpstream()
+        pay_up = MockUpstream()
+        registry = UpstreamRegistry()
+        registry.register(
+            UpstreamConfig(name="default", base_url="http://default",
+                           transport=default_up.transport, max_attempts=1,
+                           sleep_func=lambda _: None))
+        registry.register(
+            UpstreamConfig(name="pay", base_url="http://pay",
+                           transport=pay_up.transport, max_attempts=1,
+                           sleep_func=lambda _: None))
+        tc = TestClient(create_app(registry), raise_server_exceptions=False)
+
+        assert tc.post("/gateway/pay/create", json=PAYLOAD_V2).status_code == 200
+        assert pay_up.calls == 1 and default_up.calls == 0  # 第一段是已登记名 -> 新路由
+        assert tc.post("/gateway/refund", json=PAYLOAD_V2).status_code == 200
+        assert default_up.calls == 1  # 第一段不是已登记名 -> 老路径走 default
+        assert pay_up.calls == 1

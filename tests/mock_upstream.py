@@ -9,6 +9,7 @@
 - missing_field  返回 200 但缺少必填字段
 - invalid_json   返回 200 但响应体不是合法 JSON
 - not_object     返回 200 且是合法 JSON，但顶层不是对象（数组）
+- html_5xx       返回 500 但响应体是 HTML 错误页（顶着 5xx 的非法 JSON）
 - slow           正常返回，但每次调用阻塞 slow_delay 秒（模拟慢上游）
 - flaky          前 flaky_failures 次返回 500，之后恢复正常
 """
@@ -59,6 +60,11 @@ class MockUpstream:
                                   headers={"Content-Type": "text/html"})
         if self.scenario == "not_object":
             return httpx.Response(200, json=["tx-1", "tx-2"])
+        if self.scenario == "html_5xx":
+            return httpx.Response(
+                500, content=b"<html><body>500 Internal Server Error</body></html>",
+                headers={"Content-Type": "text/html"},
+            )
         if self.scenario == "slow":
             time.sleep(self.slow_delay)
             return self._ok(request)

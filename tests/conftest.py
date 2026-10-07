@@ -14,7 +14,7 @@ AREA_BY_MODULE = {
     "test_errors": "错误归一化",
     "test_circuit_breaker": "熔断器",
     "test_client": "单上游客户端(重试/限流/幂等/版本)",
-    "test_app": "HTTP入口(统一错误体/多上游路由)",
+    "test_app": "HTTP入口(统一错误体/多上游路由/老路径兼容)",
     "test_concurrency": "并发名额(舱壁)",
     "test_registry": "多上游隔离与健康",
     "test_semantics": "调用语义(幂等冲突/版本适配/非法响应)",

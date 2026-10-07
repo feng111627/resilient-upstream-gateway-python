@@ -7,6 +7,11 @@
   不会拖累其他上游。
 - health() 分别给出每个上游的当前状态（熔断状态、在飞数、剩余令牌），
   而不是一个笼统的整体状态。
+
+两种登记方式并存（新方式加在旁边，不顶掉旧方式）：
+- register(UpstreamConfig(...))：由注册表按配置装配整套独享组件；
+- register_client("pay", client)：登记调用方自己按老式构造方法
+  new 出来的 ResilientUpstreamClient，照常按名字路由、看健康状态。
 """
 
 from __future__ import annotations
@@ -56,25 +61,47 @@ class UpstreamConfig:
 
 
 class _UpstreamEntry:
-    """一个上游 = 一个客户端 + 它独享的各组件（健康状态从这里读）。"""
+    """一个上游 = 一个客户端 + 它独享的各组件（健康状态从这里读）。
 
-    def __init__(self, config: UpstreamConfig) -> None:
-        self.config = config
-        self.circuit = CircuitBreaker(
+    既可以由 UpstreamConfig 装配（from_config），也可以包住调用方
+    自己构造的现成客户端（from_client），后者不替换客户端内部任何组件。
+    """
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        base_url: str,
+        client: ResilientUpstreamClient,
+        circuit: CircuitBreaker,
+        rate_limiter: TokenBucketRateLimiter,
+        concurrency: ConcurrencyLimiter | None,
+    ) -> None:
+        self.name = name
+        self.base_url = base_url
+        self.client = client
+        self.circuit = circuit
+        self.rate_limiter = rate_limiter
+        self.concurrency = concurrency
+
+    @classmethod
+    def from_config(cls, config: UpstreamConfig) -> "_UpstreamEntry":
+        circuit = CircuitBreaker(
             failure_threshold=config.failure_threshold,
             success_threshold=config.success_threshold,
             recovery_timeout=config.recovery_timeout,
         )
-        self.rate_limiter = TokenBucketRateLimiter(
+        rate_limiter = TokenBucketRateLimiter(
             rate=config.rate, capacity=config.rate_capacity
         )
-        self.concurrency = ConcurrencyLimiter(
+        concurrency = ConcurrencyLimiter(
             max_in_flight=config.max_in_flight,
             overflow=config.overflow,
             max_wait=config.max_wait,
         )
-        self.client = ResilientUpstreamClient(
+        client = ResilientUpstreamClient(
             base_url=config.base_url,
+            name=config.name,
             timeout=config.timeout,
             retry_policy=RetryPolicy(
                 max_attempts=config.max_attempts,
@@ -82,21 +109,41 @@ class _UpstreamEntry:
                 max_delay=config.retry_max_delay,
                 jitter=config.retry_jitter,
             ),
-            circuit_breaker=self.circuit,
-            rate_limiter=self.rate_limiter,
-            concurrency_limiter=self.concurrency,
+            circuit_breaker=circuit,
+            rate_limiter=rate_limiter,
+            concurrency_limiter=concurrency,
             idempotency_store=IdempotencyStore(),
             transport=config.transport,
             sleep_func=config.sleep_func,
         )
+        return cls(
+            name=config.name,
+            base_url=config.base_url,
+            client=client,
+            circuit=circuit,
+            rate_limiter=rate_limiter,
+            concurrency=concurrency,
+        )
+
+    @classmethod
+    def from_client(cls, name: str, client: ResilientUpstreamClient) -> "_UpstreamEntry":
+        """包住调用方自己构造的现成客户端：组件沿用客户端已有的，不重新装配。"""
+        return cls(
+            name=name,
+            base_url=client.base_url,
+            client=client,
+            circuit=client.circuit_breaker,
+            rate_limiter=client.rate_limiter,
+            concurrency=client.concurrency_limiter,
+        )
 
     def health(self) -> dict:
         return {
-            "name": self.config.name,
-            "base_url": self.config.base_url,
+            "name": self.name,
+            "base_url": self.base_url,
             "circuit": self.circuit.state.value,
-            "in_flight": self.concurrency.in_flight,
-            "max_in_flight": self.concurrency.max_in_flight,
+            "in_flight": self.concurrency.in_flight if self.concurrency else 0,
+            "max_in_flight": self.concurrency.max_in_flight if self.concurrency else None,
             "available_tokens": round(self.rate_limiter.available_tokens, 3),
         }
 
@@ -114,7 +161,26 @@ class UpstreamRegistry:
         with self._lock:
             if config.name in self._upstreams:
                 raise ValueError(f"上游 {config.name!r} 已登记")
-            self._upstreams[config.name] = _UpstreamEntry(config)
+            self._upstreams[config.name] = _UpstreamEntry.from_config(config)
+
+    def register_client(self, name: str, client: ResilientUpstreamClient) -> None:
+        """登记调用方自己构造好的客户端（老式注入方式继续可用）。"""
+        if not name:
+            raise ValueError("上游名称不能为空")
+        with self._lock:
+            if name in self._upstreams:
+                raise ValueError(f"上游 {name!r} 已登记")
+            client.bind_name(name)  # 回填名字，使幂等指纹覆盖上游身份
+            self._upstreams[name] = _UpstreamEntry.from_client(name, client)
+
+    @classmethod
+    def with_client(
+        cls, name: str, client: ResilientUpstreamClient
+    ) -> "UpstreamRegistry":
+        """便捷构造：单上游时代直接 new 客户端的用法，升级后照常可用。"""
+        registry = cls()
+        registry.register_client(name, client)
+        return registry
 
     def names(self) -> list[str]:
         with self._lock:
@@ -153,7 +219,7 @@ class UpstreamRegistry:
         """每个上游分别的状态，不给笼统的整体结论。"""
         with self._lock:
             entries = [self._upstreams[n] for n in sorted(self._upstreams)]
-        return {e.config.name: e.health() for e in entries}
+        return {e.name: e.health() for e in entries}
 
     def close(self) -> None:
         with self._lock:
