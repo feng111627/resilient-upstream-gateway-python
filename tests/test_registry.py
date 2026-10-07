@@ -9,6 +9,8 @@ from gateway.circuit_breaker import CircuitState
 from gateway.errors import (
     CapacityFullError,
     CircuitOpenError,
+    ErrorKind,
+    IdempotencyConflictError,
     UnknownUpstreamError,
     UpstreamServerError,
 )
@@ -147,6 +149,44 @@ class TestIsolation:
             )
         assert registry.health("small")["max_in_flight"] == 1
         assert registry.health("big")["max_in_flight"] == 5
+
+
+class TestIdempotencyAcrossUpstreams:
+    def test_same_key_same_payload_different_upstream_conflicts(self):
+        """同键同报文换上游：判定范围含目标上游，明确报冲突，不在新上游重复执行。"""
+        alpha, beta = MockUpstream(), MockUpstream()
+        registry = make_registry(alpha=alpha, beta=beta)
+        registry.call("alpha", "/pay", payload=PAYLOAD_V2, idempotency_key="k-x")
+        with pytest.raises(IdempotencyConflictError) as exc_info:
+            registry.call("beta", "/pay", payload=PAYLOAD_V2, idempotency_key="k-x")
+        assert exc_info.value.kind is ErrorKind.IDEMPOTENCY_CONFLICT
+        assert alpha.calls == 1
+        assert beta.calls == 0  # 冲突请求没有打到第二个上游
+
+    def test_same_key_identical_request_same_upstream_still_reuses(self):
+        """同键、上游/接口/版本/报文完全一致：照常复用，不重复产生副作用。"""
+        alpha, beta = MockUpstream(), MockUpstream()
+        registry = make_registry(alpha=alpha, beta=beta)
+        r1 = registry.call("alpha", "/pay", payload=PAYLOAD_V2, idempotency_key="k-y")
+        r2 = registry.call("alpha", "/pay", payload=PAYLOAD_V2, idempotency_key="k-y")
+        assert r1 == r2
+        assert alpha.calls == 1
+        # 冲突不影响原键结论：换上游报过冲突后，原上游正确请求仍复用原结论
+        with pytest.raises(IdempotencyConflictError):
+            registry.call("beta", "/pay", payload=PAYLOAD_V2, idempotency_key="k-y")
+        r3 = registry.call("alpha", "/pay", payload=PAYLOAD_V2, idempotency_key="k-y")
+        assert r3 == r1
+        assert alpha.calls == 1
+        assert beta.calls == 0
+
+    def test_different_keys_on_different_upstreams_are_independent(self):
+        """不同幂等键互不干扰：各上游正常各自执行。"""
+        alpha, beta = MockUpstream(), MockUpstream()
+        registry = make_registry(alpha=alpha, beta=beta)
+        r1 = registry.call("alpha", "/pay", payload=PAYLOAD_V2, idempotency_key="k-1")
+        r2 = registry.call("beta", "/pay", payload=PAYLOAD_V2, idempotency_key="k-2")
+        assert r1["status"] == "ok" and r2["status"] == "ok"
+        assert alpha.calls == 1 and beta.calls == 1
 
 
 class TestHealth:

@@ -14,11 +14,12 @@ gateway/
   rate_limiter.py     令牌桶限流
   concurrency.py      并发名额限制（舱壁）：reject/wait 两种溢出策略
   retry.py            指数退避 + 抖动的重试策略
-  idempotency.py      幂等键：重复提交复用结论；同键换内容报冲突
+  idempotency.py      幂等键：重复提交复用结论；同键换请求（上游/接口/版本/报文）报冲突
   versioning.py       版本协商 + 请求按版本组装校验 + 响应 schema 校验
   client.py           ResilientUpstreamClient：以上能力的组合（单上游）
   registry.py         多上游注册表：按名字路由，配置与状态逐上游隔离
-main.py               FastAPI 入口：POST /gateway/{upstream}/{path}
+main.py               FastAPI 入口：POST /gateway/{upstream}/{path}（按名字）
+                      及兼容老路径 POST /gateway/{path}（打到 default 上游）
 tests/                单测 + 本地模拟上游（不依赖任何外部服务）
 ```
 
@@ -65,11 +66,34 @@ registry.register(UpstreamConfig(name="risk", base_url="http://risk:9002",
 registry.call("pay", "/pay", payload={"amount": 100, "currency": "CNY"})
 ```
 
+### 与单上游老用法的兼容
+
+多上游是**在旁边加**的能力，单上游时代的用法升级后照常可用：
+
+- **老路径**：`POST /gateway/{path}`（不带上游名）仍然有效，固定打到名为
+  `default` 的上游；未登记 `default` 时返回明确的 `unknown_upstream`（404）。
+  多段路径 `/gateway/a/b` 优先按「名字路由」解析（`a` 为上游名）。
+- **老构造方式**：`create_app(client)` 仍接受直接构造的
+  `ResilientUpstreamClient`，客户端会被登记为 `default` 上游，
+  其熔断/限流/并发组件原样保留，健康端点照常可读：
+
+  ```python
+  from main import create_app
+  from gateway.client import ResilientUpstreamClient
+
+  app = create_app(ResilientUpstreamClient(base_url="http://127.0.0.1:9000"))
+  ```
+
+- 代码侧也可以把现成客户端登记为具名上游：
+  `registry.register_client("pay", client)`。
+
 ## 隔离与配额规则
 
 - **逐上游独立组件**：每个上游独享 httpx 客户端（独立地址/超时）、重试策略、
-  熔断器、令牌桶、并发名额、幂等存储。某个上游挂了或一直超时，只会熔断、
+  熔断器、令牌桶、并发名额。某个上游挂了或一直超时，只会熔断、
   限流、占满**它自己**的额度，别的上游照常服务。
+  （幂等存储是注册表级共享的，见「幂等」一节——幂等是调用方层面的语义，
+  与上游运行状态隔离互不影响。）
 - **并发名额（舱壁）**：每个上游限制同时在飞请求数 `max_in_flight`。名额在
   进入调用时获取，无论成功、失败还是中途被限流/熔断放弃，都在 finally 中
   归还——慢上游不会泄漏名额，也不会占别的上游的名额。溢出策略：
@@ -107,10 +131,16 @@ registry.call("pay", "/pay", payload={"amount": 100, "currency": "CNY"})
 底层异常类型名只放在内部 `detail` 字段，不出现在对外的 `error`/`message` 中；
 JSON 解析等底层异常也绝不原样抛给调用方。
 
+**非法响应优先于状态码归类**：只要响应体不是合法 JSON（比如上游甩回一坨
+HTML 错误页），无论状态码是 200 还是 502，都归 `invalid_response` 且不重试——
+不会被当成上游 5xx 反复重试。5xx 且报文是合法 JSON 时仍按 `upstream_5xx`
+正常重试。
+
 ## 重试与熔断规则
 
 **重试**（`RetryPolicy`）：只对可重试错误（超时、连接失败、上游 5xx）重试，
-4xx、请求/响应校验问题不重试。退避公式
+4xx、请求/响应校验问题、非法 JSON 响应（`invalid_response`）都不重试。
+退避公式
 `min(max_delay, base_delay * 2^(n-1)) * (1 ± jitter)`，默认最多 3 次尝试。
 
 **熔断**（`CircuitBreaker`）三态切换：
@@ -131,9 +161,14 @@ JSON 解析等底层异常也绝不原样抛给调用方。
 
 - 首个请求真正执行；执行期间的并发重复提交阻塞等待并拿到相同结论；
 - 完成后的结论（成功或失败）在 TTL（默认 300s）内缓存，重复提交直接复用；
-- **同一幂等键换了请求内容**（按规范化后的请求体指纹判断）不再默默复用旧
-  结论，而是返回 `idempotency_conflict`（HTTP 409）；冲突不会污染原键，
-  用原内容重复提交仍能拿到原结论；
+- **判定范围是整个请求**：打到哪个上游、哪个接口（路径）、走哪个版本、
+  报文内容，全部计入请求指纹。同一幂等键只要其中任何一项变了，
+  就是两次不同的调用，明确返回 `idempotency_conflict`（HTTP 409），
+  绝不把上一次的结论原样复用回去，也不会在新目标上重复执行；
+- 同键、上游/接口/版本/报文完全一致的重复提交照常复用旧结论；
+- 并发同时打进来不会乱：同请求的都拿到同一结论，换请求的全报冲突，
+  只有 owner 真正执行一次；冲突不会污染原键——报过冲突之后，
+  用原请求重复提交仍能拿到原结论；
 - 因此重试或重复提交不会造成重复副作用。
 
 ## 版本兼容
@@ -170,12 +205,15 @@ uv run pytest tests/ -v
 - `tests/test_concurrency.py`：并发名额——reject/wait 两种溢出策略、
   成功/失败/中途放弃后名额正确归还、30 并发打 2 个名额不堆积；
 - `tests/test_registry.py`：多上游隔离——一个上游熔断/限流/占满名额/卡慢
-  不影响其他上游，健康状态逐上游分别上报；
-- `tests/test_semantics.py`：同幂等键换内容报冲突且不污染原键、
-  请求按 v1/v2 组装校验、非法 JSON/顶层非对象归 `invalid_response`、
+  不影响其他上游，健康状态逐上游分别上报；同一幂等键换上游报冲突、
+  同键同请求同上游照常复用、不同键互不影响；
+- `tests/test_semantics.py`：同幂等键换接口/换版本/换报文报冲突且不污染原键、
+  并发下同键混合请求结论一致、请求按 v1/v2 组装校验、
+  非法 JSON（含 5xx+HTML 错误页）归 `invalid_response` 且不重试、
   缺字段仍归 `schema_mismatch`、解析异常不外泄；
 - `tests/test_app.py`：HTTP 层多上游路由、统一错误体、状态码、幂等头、
-  版本头、分上游健康端点。
+  版本头、分上游健康端点，以及单上游老用法兼容（老路径
+  `/gateway/{path}` 打到 default 上游、`create_app(client)` 老构造方式）。
 
 本地启动网关（多上游）：
 
@@ -188,4 +226,15 @@ curl -X POST localhost:8000/gateway/pay/pay \
   -d '{"amount": 100, "currency": "CNY"}'
 curl localhost:8000/health        # 每个上游分别的状态
 curl localhost:8000/health/pay    # 单个上游的状态
+```
+
+本地启动网关（单上游老用法，老路径不打上游名）：
+
+```bash
+export UPSTREAM_BASE_URL='http://127.0.0.1:9000'   # 不设置 UPSTREAMS，自动登记为 default
+uv run python main.py
+curl -X POST localhost:8000/gateway/pay \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: order-123' \
+  -d '{"amount": 100, "currency": "CNY"}'
 ```

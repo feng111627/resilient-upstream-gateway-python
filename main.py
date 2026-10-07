@@ -1,17 +1,28 @@
-"""弹性上游网关 HTTP 入口（多上游版）。
+"""弹性上游网关 HTTP 入口（多上游版，兼容单上游老用法）。
 
-- POST /gateway/{upstream}/{path}：按名字路由到对应上游，自动做错误归一化、
-  限流、并发名额、熔断、重试、幂等（Idempotency-Key 头）、版本协商（X-Api-Version 头）。
+路由：
+- POST /gateway/{upstream}/{path}：按名字路由到对应上游（多上游新用法）。
+- POST /gateway/{path}：单上游时代的老路径，路由到名为 "default" 的上游，
+  升级后老调用照常可用（按名字的路由是在旁边加的，没有顶掉老路径）。
 - GET /health：每个上游分别的状态（熔断/在飞数/剩余令牌），不给笼统整体结论。
 - GET /health/{upstream}：单个上游的状态。
-- 所有失败都返回统一错误体：{"error": <类别>, "message": ..., "retryable": ...}，
-  绝不把底层库异常原样透给调用方。
+
+每次调用自动做错误归一化、限流、并发名额、熔断、重试、
+幂等（Idempotency-Key 头）、版本协商（X-Api-Version 头）。
+所有失败都返回统一错误体：{"error": <类别>, "message": ..., "retryable": ...}，
+绝不把底层库异常原样透给调用方。
 
 上游配置：环境变量 UPSTREAMS 为 JSON，例如
   {"pay": {"base_url": "http://127.0.0.1:9001", "max_in_flight": 10},
    "risk": {"base_url": "http://127.0.0.1:9002", "overflow": "wait", "max_wait": 0.5}}
 未设置 UPSTREAMS 时回退到单上游：UPSTREAM_BASE_URL（默认 http://127.0.0.1:9000），
 名字为 "default"。
+
+兼容说明：
+- create_app() 既接受 UpstreamRegistry（新），也接受直接构造的
+  ResilientUpstreamClient（老用法），后者会被登记为 "default" 上游。
+- 多段路径 /gateway/a/b 优先按「名字路由」解析（a 为上游名）；
+  单段路径 /gateway/pay 走老路径，打到 "default" 上游。
 """
 
 from __future__ import annotations
@@ -23,6 +34,7 @@ import uvicorn
 from fastapi import FastAPI, Header, Request
 from fastapi.responses import JSONResponse
 
+from gateway.client import ResilientUpstreamClient
 from gateway.errors import ErrorKind, GatewayError
 from gateway.registry import UpstreamConfig, UpstreamRegistry
 
@@ -65,10 +77,22 @@ def registry_from_env() -> UpstreamRegistry:
     return registry
 
 
-def create_app(registry: UpstreamRegistry | None = None) -> FastAPI:
-    """构建应用。不传注册表时从环境变量构建（UPSTREAMS / UPSTREAM_BASE_URL）。"""
+def create_app(
+    registry: UpstreamRegistry | ResilientUpstreamClient | None = None,
+) -> FastAPI:
+    """构建应用。
+
+    - 不传：从环境变量构建注册表（UPSTREAMS / UPSTREAM_BASE_URL）；
+    - 传 UpstreamRegistry：多上游新用法；
+    - 传 ResilientUpstreamClient：单上游时代的老用法，客户端被登记为
+      "default" 上游，老路径 /gateway/{path} 照常可用。
+    """
     if registry is None:
         registry = registry_from_env()
+    elif isinstance(registry, ResilientUpstreamClient):
+        client = registry
+        registry = UpstreamRegistry()
+        registry.register_client(DEFAULT_UPSTREAM, client)
 
     app = FastAPI(title="resilient-upstream-gateway")
     app.state.registry = registry
@@ -89,7 +113,7 @@ def create_app(registry: UpstreamRegistry | None = None) -> FastAPI:
         return registry.health(upstream)
 
     @app.post("/gateway/{upstream}/{path:path}")
-    def proxy(
+    def proxy_named(
         upstream: str,
         path: str,
         payload: dict | None = None,
@@ -98,6 +122,22 @@ def create_app(registry: UpstreamRegistry | None = None) -> FastAPI:
     ) -> dict:
         return registry.call(
             upstream,
+            f"/{path}",
+            idempotency_key=idempotency_key,
+            version=x_api_version,
+            payload=payload,
+        )
+
+    @app.post("/gateway/{path:path}")
+    def proxy_default(
+        path: str,
+        payload: dict | None = None,
+        idempotency_key: str | None = Header(default=None),
+        x_api_version: str | None = Header(default=None),
+    ) -> dict:
+        # 单上游时代的老路径：打到 "default" 上游，升级后老调用照常可用
+        return registry.call(
+            DEFAULT_UPSTREAM,
             f"/{path}",
             idempotency_key=idempotency_key,
             version=x_api_version,

@@ -8,6 +8,7 @@
 - server_error   返回 500
 - missing_field  返回 200 但缺少必填字段
 - invalid_json   返回 200 但响应体不是合法 JSON
+- server_error_html 返回 502 且响应体不是合法 JSON（HTML 错误页）
 - not_object     返回 200 且是合法 JSON，但顶层不是对象（数组）
 - slow           正常返回，但每次调用阻塞 slow_delay 秒（模拟慢上游）
 - flaky          前 flaky_failures 次返回 500，之后恢复正常
@@ -56,6 +57,9 @@ class MockUpstream:
             return httpx.Response(200, json={"id": "tx-1", "status": "ok"})  # 缺 amount 等
         if self.scenario == "invalid_json":
             return httpx.Response(200, content=b"<html>not json</html>",
+                                  headers={"Content-Type": "text/html"})
+        if self.scenario == "server_error_html":
+            return httpx.Response(502, content=b"<html>Bad Gateway</html>",
                                   headers={"Content-Type": "text/html"})
         if self.scenario == "not_object":
             return httpx.Response(200, json=["tx-1", "tx-2"])
